@@ -37,6 +37,8 @@ Przed uruchomieniem zapisz plik Excel, żeby zawierał aktualne wyniki formuł.
 
 ## Budowa exe
 
+Najnowszy plik exe: https://github.com/cienki90/obliczenia2word/releases/tag/najnowsza-wersja
+
 Plik exe buduje się automatycznie w GitHub Actions (`.github/workflows/build-exe.yml`)
 na Windows. Workflow testuje go też na przykładowych plikach. Ręcznie (na Windows):
 

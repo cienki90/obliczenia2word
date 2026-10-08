@@ -53,6 +53,16 @@ jobs:
           Get-Content tk.txt
           if ($p.ExitCode -ne 0) { throw "test okienek nie powiódł się" }
 
+      - name: Publikacja exe w wydaniu „najnowsza-wersja”
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "najnowsza-wersja"
+          gh release delete $tag --yes --cleanup-tag 2>$null
+          $notes = "Pobierz Obliczenia2Word.exe i uruchom dwuklikiem (Windows 7/8/10/11, bez instalacji). Zbudowano z $env:GITHUB_REF_NAME ($($env:GITHUB_SHA.Substring(0,7)))."
+          gh release create $tag "dist/Obliczenia2Word.exe" --target $env:GITHUB_SHA --title "Obliczenia2Word – najnowsza wersja" --notes $notes
+
       - uses: actions/upload-artifact@v4
         with:
           name: Obliczenia2Word
