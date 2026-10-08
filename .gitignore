@@ -1,3 +1,7 @@
 wynik/
+test_wynik/
 __pycache__/
+build/
+dist/
+*.spec
 ~$*

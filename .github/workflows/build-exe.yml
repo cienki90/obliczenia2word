@@ -1,0 +1,62 @@
+name: Budowa pliku exe (Windows)
+
+on:
+  push:
+    paths:
+      - "obliczenia2word.py"
+      - "requirements.txt"
+      - ".github/workflows/build-exe.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      # Python 3.8 w wersji 32-bitowej + PyInstaller 5 => exe działa na
+      # Windows 7, 8, 10 i 11, zarówno 32-, jak i 64-bitowych.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.8"
+          architecture: x86
+
+      - name: Instalacja bibliotek
+        run: |
+          python -m pip install --upgrade pip
+          pip install "python-docx>=1.1,<2" "openpyxl>=3.1,<3.2" "lxml<5.4" "pyinstaller==5.13.2"
+
+      - name: Budowa exe
+        run: >
+          pyinstaller --noconfirm --onefile --windowed --noupx
+          --name "Obliczenia2Word"
+          --collect-data docx
+          obliczenia2word.py
+
+      - name: Test – wstawienie tabel do przykładowych opisów
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath "dist\Obliczenia2Word.exe" -Wait -PassThru -ArgumentList @('-x', '"Obliczenia - zestawienie pw.xlsx"', '-o', 'test_wynik', '--raport', 'raport.txt', '.')
+          Get-Content raport.txt -Encoding utf8
+          if ($p.ExitCode -ne 0) { throw "exe zakończył się kodem $($p.ExitCode)" }
+          foreach ($f in '112','115','181','191') { if (-not (Test-Path "test_wynik\$f.docx")) { throw "brak test_wynik\$f.docx" } }
+          if (-not (Select-String -Path raport.txt -Pattern 'wypełniono 4' -Encoding utf8)) { throw "nie wypełniono 4 opisów" }
+          if (-not (Select-String -Path raport.txt -Pattern '„918”' -Encoding utf8)) { throw "nie wykryto czerwonej komórki w arkuszu 918" }
+
+      - name: Test – okienka (tkinter)
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath "dist\Obliczenia2Word.exe" -Wait -PassThru -ArgumentList @('--test-okien', 'tk.txt')
+          Get-Content tk.txt
+          if ($p.ExitCode -ne 0) { throw "test okienek nie powiódł się" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Obliczenia2Word
+          path: |
+            dist/Obliczenia2Word.exe
+            test_wynik/*.docx
+            raport.txt

@@ -2,23 +2,22 @@
 """
 obliczenia2word – automatyczne wstawianie tabel z obliczeniami (Excel) do projektów (Word).
 
-Dla każdego pliku .docx (np. 181.docx) program:
-  1. wybiera arkusz o tej samej nazwie w pliku Excel (np. arkusz "181"),
-  2. odtwarza zakres wydruku arkusza jako tabelę Word z zachowaniem formatowania
-     (scalenia komórek, obramowania, czcionki, pogrubienia, wyrównanie, wysokości
-     wierszy, szerokości kolumn, wypełnienia, format liczb),
-  3. wstawia tabelę w rozdziale „Zestawienie zbiorcze słupów” – w tym samym miejscu,
-     co w poprawnie wykonanych plikach (112.docx, 115.docx),
-  4. zapisuje wynik (domyślnie do folderu "wynik").
+Uruchomiony bez parametrów (np. dwuklikiem w plik .exe) program pyta w okienkach o:
+  1. plik Excel z obliczeniami,
+  2. folder z opisami (.docx),
+  3. folder, w którym zapisać gotowe opisy.
 
-Jeżeli dokument ma już wstawioną tabelę, zostanie ona podmieniona na aktualną.
+Dla każdego opisu (np. 181.docx) program:
+  * wybiera arkusz o tej samej nazwie/numerze (np. arkusz "181"),
+  * odtwarza zakres wydruku arkusza jako tabelę Word z formatowaniem z Excela,
+  * wstawia ją w rozdziale „Zestawienie zbiorcze słupów” (jak w 112.docx i 115.docx),
+  * pilnuje, żeby za tabelą nie powstała pusta strona.
+Na koniec pokazuje raport, w tym listę czerwonych komórek w tabelach z obliczeniami.
 
-Użycie:
-    python obliczenia2word.py                          # wszystkie .docx z bieżącego folderu
-    python obliczenia2word.py 181.docx 191.docx        # wybrane pliki
-    python obliczenia2word.py -x "Obliczenia.xlsx" -o gotowe 181.docx
+Wiersz poleceń (opcjonalnie):
+    python obliczenia2word.py -x "Obliczenia.xlsx" -o wynik folder_z_opisami
     python obliczenia2word.py --arkusz 181 projekt.docx
-    python obliczenia2word.py --nadpisz 181.docx       # zapis w miejscu oryginału
+    python obliczenia2word.py --nadpisz 181.docx
 """
 from __future__ import annotations
 
@@ -43,6 +42,7 @@ except ImportError:  # pragma: no cover
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 W = "{%s}" % W_NS
 
+APP_NAME = "Obliczenia do Worda"
 HEADING_TEXT = "Zestawienie zbiorcze słupów"
 DEFAULT_EMPTY_PARAGRAPHS_BEFORE = 5   # tak jak w 112.docx i 115.docx
 KEEP_WITH_NEXT = re.compile(r"obw nr|\bLp\b", re.IGNORECASE)
@@ -81,19 +81,108 @@ V_ALIGN_MAP = {"top": "top", "center": "center", "bottom": "bottom",
 # --------------------------------------------------------------------------- #
 #  Excel -> model tabeli
 # --------------------------------------------------------------------------- #
+THEME_COLORS: list[str] = []   # kolory motywu bieżącego skoroszytu (indeks jak w Excelu)
+
+
+def load_theme_colors(wb) -> list[str]:
+    """Odczytuje paletę motywu skoroszytu (potrzebną dla kolorów typu „motyw”)."""
+    order = ["lt1", "dk1", "lt2", "dk2", "accent1", "accent2", "accent3",
+             "accent4", "accent5", "accent6", "hlink", "folHlink"]
+    colors = {}
+    try:
+        from lxml import etree
+        root = etree.fromstring(wb.loaded_theme)
+        ns = {"a": "http://schemas.openxmlformats.org/drawingml/2006/main"}
+        scheme = root.find(".//a:clrScheme", ns)
+        for el in scheme:
+            name = etree.QName(el).localname
+            clr = el[0]
+            colors[name] = (clr.get("val") if etree.QName(clr).localname == "srgbClr"
+                            else clr.get("lastClr")) or None
+    except Exception:
+        pass
+    defaults = ["FFFFFF", "000000", "E7E6E6", "44546A", "4472C4", "ED7D31",
+                "A5A5A5", "FFC000", "5B9BD5", "70AD47", "0563C1", "954F72"]
+    return [(colors.get(n) or d).upper() for n, d in zip(order, defaults)]
+
+
+def _apply_tint(rgb: str, tint: float) -> str:
+    import colorsys
+    r, g, b = (int(rgb[i:i + 2], 16) / 255 for i in (0, 2, 4))
+    h, lum, s = colorsys.rgb_to_hls(r, g, b)
+    lum = lum * (1 + tint) if tint < 0 else lum * (1 - tint) + tint
+    r, g, b = colorsys.hls_to_rgb(h, max(0.0, min(1.0, lum)), s)
+    return "%02X%02X%02X" % (round(r * 255), round(g * 255), round(b * 255))
+
+
 def _rgb(color) -> str | None:
-    """Zwraca kolor w formacie RRGGBB (tylko kolory zdefiniowane wprost jako RGB)."""
+    """Zwraca kolor w formacie RRGGBB (obsługuje kolory RGB, z motywu i indeksowane)."""
     if color is None:
         return None
     try:
-        if color.type != "rgb":
+        ctype = color.type
+        if ctype == "rgb":
+            rgb = color.rgb
+            if not isinstance(rgb, str) or len(rgb) < 6:
+                return None
+            rgb = rgb[-6:].upper()
+        elif ctype == "theme":
+            idx = int(color.theme)
+            palette = THEME_COLORS or load_theme_colors(None)
+            if not 0 <= idx < len(palette):
+                return None
+            rgb = palette[idx]
+        elif ctype == "indexed":
+            from openpyxl.styles.colors import COLOR_INDEX
+            idx = int(color.indexed)
+            if idx >= 64 or idx >= len(COLOR_INDEX):   # kolory systemowe
+                return None
+            rgb = COLOR_INDEX[idx][-6:].upper()
+        else:
             return None
-        rgb = color.rgb
+        tint = float(color.tint or 0)
+        return _apply_tint(rgb, tint) if tint else rgb
     except Exception:
         return None
-    if not isinstance(rgb, str) or len(rgb) < 6:
-        return None
-    return rgb[-6:].upper()
+
+
+def is_red(rgb: str | None) -> bool:
+    """Czy kolor jest czerwony (od jasnoczerwonego/różowego tła po ciemną czerwień)."""
+    if not rgb:
+        return False
+    import colorsys
+    r, g, b = (int(rgb[i:i + 2], 16) / 255 for i in (0, 2, 4))
+    h, s, v = colorsys.rgb_to_hsv(r, g, b)
+    hue = h * 360
+    return (hue <= 15 or hue >= 340) and s >= 0.15 and v >= 0.35
+
+
+def find_red_cells(ws, ws_values):
+    """Zwraca listę czerwonych komórek w tabeli (zakresie wydruku) arkusza:
+    [(adres, opis, wartość), ...]."""
+    min_col, min_row, max_col, max_row = sheet_area(ws)
+    covered = set()
+    for rng in ws.merged_cells.ranges:
+        for r in range(rng.min_row, rng.max_row + 1):
+            for c in range(rng.min_col, rng.max_col + 1):
+                if (r, c) != (rng.min_row, rng.min_col):
+                    covered.add((r, c))
+    found = []
+    for r in range(min_row, max_row + 1):
+        for c in range(min_col, max_col + 1):
+            if (r, c) in covered:
+                continue
+            cell = ws.cell(r, c)
+            value = ws_values.cell(r, c).value
+            reasons = []
+            if cell.fill is not None and cell.fill.fill_type and is_red(_rgb(cell.fill.fgColor)):
+                reasons.append("czerwone tło")
+            if value not in (None, "") and is_red(_rgb(cell.font.color)):
+                reasons.append("czerwony tekst")
+            if reasons:
+                text = format_value(value, cell.number_format).replace("\n", " ")
+                found.append((cell.coordinate, ", ".join(reasons), text))
+    return found
 
 
 def format_value(value, number_format: str) -> str:
@@ -141,17 +230,25 @@ def column_widths_chars(ws, min_col: int, max_col: int) -> list[float]:
     return [0.0 if c in hidden else widths[c] for c in range(min_col, max_col + 1)]
 
 
-def read_sheet(ws, ws_values):
-    """Czyta arkusz i zwraca prosty model: kolumny, wiersze, komórki z formatowaniem."""
+def sheet_area(ws):
+    """Zakres tabeli: obszar wydruku arkusza, a gdy go nie ma – używany zakres."""
     area = None
     if ws.print_area:
-        pa = ws.print_area
-        pa = pa[0] if isinstance(pa, (list, tuple)) else pa
-        pa = pa.split(",")[0].split("!")[-1].replace("$", "")
-        area = range_boundaries(pa)
-    if not area:
+        try:
+            pa = ws.print_area
+            pa = pa[0] if isinstance(pa, (list, tuple)) else pa
+            pa = pa.split(",")[0].split("!")[-1].replace("$", "")
+            area = range_boundaries(pa)
+        except Exception:
+            area = None
+    if not area or None in area:
         area = range_boundaries(ws.calculate_dimension())
-    min_col, min_row, max_col, max_row = area
+    return area
+
+
+def read_sheet(ws, ws_values):
+    """Czyta arkusz i zwraca prosty model: kolumny, wiersze, komórki z formatowaniem."""
+    min_col, min_row, max_col, max_row = sheet_area(ws)
 
     col_chars = column_widths_chars(ws, min_col, max_col)
     default_h = ws.sheet_format.defaultRowHeight or 15
@@ -475,6 +572,73 @@ def sheet_for_document(wb, docx_path, sheet_name=None):
     raise ValueError(f'nie znaleziono arkusza pasującego do pliku "{os.path.basename(docx_path)}"')
 
 
+# --------------------------------------------------------------------------- #
+#  Pilnowanie, żeby za tabelą nie powstała pusta strona
+# --------------------------------------------------------------------------- #
+def _has_page_break(p):
+    return any(br.get(W + "type") == "page" for br in p.iter(W + "br"))
+
+
+def _has_page_break_before(p):
+    ppr = p.find(W + "pPr")
+    pb = ppr.find(W + "pageBreakBefore") if ppr is not None else None
+    return pb is not None and pb.get(W + "val") not in ("0", "false", "off")
+
+
+def _set_page_break_before(p):
+    ppr = p.find(W + "pPr")
+    if ppr is None:
+        ppr = parse_xml(f'<w:pPr xmlns:w="{W_NS}"/>')
+        p.insert(0, ppr)
+    old = ppr.find(W + "pageBreakBefore")
+    if old is not None:
+        ppr.remove(old)
+    pb = parse_xml(f'<w:pageBreakBefore xmlns:w="{W_NS}"/>')
+    # kolejność wg schematu: pStyle, keepNext, keepLines, pageBreakBefore, ...
+    pos = 0
+    for i, child in enumerate(ppr):
+        if child.tag in (W + "pStyle", W + "keepNext", W + "keepLines"):
+            pos = i + 1
+    ppr.insert(pos, pb)
+
+
+def prevent_blank_page(table):
+    """Za tabelą w szablonie są puste akapity i akapit ze znakiem podziału strony.
+    Gdy tabela kończy się na dole strony, puste akapity przelewają się na następną
+    stronę, a podział strony tworzy za nią kompletnie pustą stronę. Usuwamy je
+    i zamiast tego ustawiamy „podział strony przed” na pierwszym akapicie kolejnej
+    strony – taki podział nigdy nie tworzy pustej strony, niezależnie od długości tabeli."""
+    following = []
+    el = table.getnext()
+    while el is not None and _is_empty_paragraph(el):
+        following.append(el)
+        el = el.getnext()
+
+    brk = None          # indeks akapitu z podziałem strony
+    brk_before = False  # True: „podział przed akapitem”, False: znak podziału w akapicie
+    for i, p in enumerate(following):
+        if _has_page_break_before(p):
+            brk, brk_before = i, True
+        if _has_page_break(p):
+            brk, brk_before = i, False
+    if brk is None:
+        return False
+
+    remove = following[:brk] if brk_before else following[:brk + 1]
+    target = following[brk] if brk_before else (following[brk + 1] if brk + 1 < len(following) else el)
+    if target is None or target.tag != W + "p":
+        return False
+    for p in remove:
+        p.getparent().remove(p)
+    _set_page_break_before(target)
+    # Word wymaga akapitu bezpośrednio po tabeli – jeśli następny jest akapit
+    # z „podziałem przed”, to jest poprawne; nic więcej nie trzeba.
+    return True
+
+
+# --------------------------------------------------------------------------- #
+#  Przetwarzanie
+# --------------------------------------------------------------------------- #
 def process(docx_path, wb, wb_values, out_path, sheet_name=None, empty_before=DEFAULT_EMPTY_PARAGRAPHS_BEFORE):
     name = sheet_for_document(wb, docx_path, sheet_name)
     document = docx.Document(docx_path)
@@ -491,14 +655,293 @@ def process(docx_path, wb, wb_values, out_path, sheet_name=None, empty_before=DE
     else:
         anchor.addnext(table)
         action = "wstawiono tabelę"
+    prevent_blank_page(table)
     document.save(out_path)
     return name, action, len(rows)
 
 
+def missing_formula_values(ws, ws_values):
+    """Liczba formuł, dla których plik nie zawiera policzonego wyniku."""
+    n = 0
+    min_col, min_row, max_col, max_row = sheet_area(ws)
+    for row in ws.iter_rows(min_row=min_row, max_row=max_row, min_col=min_col, max_col=max_col):
+        for c in row:
+            if isinstance(c.value, str) and c.value.startswith("=") and \
+                    ws_values[c.coordinate].value is None:
+                n += 1
+    return n
+
+
+def load_workbooks(excel):
+    global THEME_COLORS
+    wb = openpyxl.load_workbook(excel)
+    wb_values = openpyxl.load_workbook(excel, data_only=True)
+    THEME_COLORS = load_theme_colors(wb)
+    return wb, wb_values
+
+
+def list_docx(folder):
+    return sorted(f for f in glob.glob(os.path.join(folder, "*.docx"))
+                  if not os.path.basename(f).startswith("~$"))
+
+
+def run_batch(excel, files, out_dir=None, overwrite=False, sheet_name=None,
+              empty_before=DEFAULT_EMPTY_PARAGRAPHS_BEFORE, progress=None):
+    """Przetwarza listę plików i sprawdza czerwone komórki. Zwraca dane do raportu."""
+    wb, wb_values = load_workbooks(excel)
+    if out_dir and not overwrite:
+        os.makedirs(out_dir, exist_ok=True)
+
+    results = []          # (plik, status, opis)  status: ok / pominiety / blad
+    used_sheets = {}      # arkusz -> plik
+    for i, f in enumerate(files):
+        base = os.path.basename(f)
+        if progress:
+            progress(i, len(files), base)
+        out = f if overwrite else os.path.join(out_dir, base)
+        try:
+            sheet = sheet_for_document(wb, f, sheet_name)
+        except ValueError as e:
+            results.append((base, "pominiety", str(e)))
+            continue
+        try:
+            sheet, action, n = process(f, wb, wb_values, out, sheet, empty_before)
+            used_sheets[sheet] = base
+            results.append((base, "ok", f"{action} z arkusza „{sheet}” ({n} wierszy)"))
+        except PermissionError:
+            results.append((base, "blad", "nie można zapisać pliku – zamknij go w Wordzie i spróbuj ponownie"))
+        except Exception as e:  # noqa: BLE001
+            results.append((base, "blad", str(e) or e.__class__.__name__))
+    if progress:
+        progress(len(files), len(files), "")
+
+    red, no_values = {}, {}
+    for ws in wb.worksheets:
+        cells = find_red_cells(ws, wb_values[ws.title])
+        if cells:
+            red[ws.title] = cells
+        if ws.title in used_sheets:
+            n = missing_formula_values(ws, wb_values[ws.title])
+            if n:
+                no_values[ws.title] = n
+    return {
+        "excel": excel, "out_dir": out_dir, "overwrite": overwrite,
+        "results": results, "red": red, "used_sheets": used_sheets,
+        "no_values": no_values,
+        "unused_sheets": [s for s in wb.sheetnames
+                          if s not in used_sheets and re.fullmatch(r"\d+", s.strip())],
+    }
+
+
+def _plural_cells(n):
+    if n == 1:
+        return "1 czerwona komórka"
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return f"{n} czerwone komórki"
+    return f"{n} czerwonych komórek"
+
+
+def report_lines(rep):
+    """Raport jako lista (tekst, rodzaj); rodzaj: title / ok / warn / err / info."""
+    L = []
+    ok = sum(1 for r in rep["results"] if r[1] == "ok")
+    err = sum(1 for r in rep["results"] if r[1] == "blad")
+    skip = sum(1 for r in rep["results"] if r[1] == "pominiety")
+    red_docs = {rep["used_sheets"].get(s) for s in rep["red"]}
+
+    L.append(("CZERWONE KOMÓRKI W TABELACH Z OBLICZENIAMI", "title"))
+    if rep["red"]:
+        for sheet, cells in rep["red"].items():
+            doc = rep["used_sheets"].get(sheet)
+            where = f"opis {doc}" if doc else "brak opisu w wybranym folderze"
+            L.append((f"  ⚠ Arkusz „{sheet}” ({where}) – {_plural_cells(len(cells))}:", "warn"))
+            for addr, why, text in cells[:30]:
+                text = (text[:90] + "…") if len(text) > 90 else text
+                L.append((f"      {addr} – {why}" + (f": „{text}”" if text else ""), "warn"))
+            if len(cells) > 30:
+                L.append((f"      … i {len(cells) - 30} kolejnych", "warn"))
+    else:
+        L.append(("  ✔ Brak czerwonych komórek.", "ok"))
+    L.append(("", "info"))
+
+    L.append((f"OPISY: wypełniono {ok}, pominięto {skip}, błędów {err}", "title"))
+    for base, status, msg in rep["results"]:
+        if status == "ok":
+            warn = base in red_docs
+            L.append((f"  {'⚠' if warn else '✔'} {base} – {msg}"
+                      + (" – UWAGA: tabela zawiera czerwone komórki" if warn else ""),
+                      "warn" if warn else "ok"))
+        elif status == "pominiety":
+            L.append((f"  – {base} – pominięto: {msg}", "info"))
+        else:
+            L.append((f"  ✘ {base} – BŁĄD: {msg}", "err"))
+    if rep["no_values"]:
+        L.append(("", "info"))
+        for sheet, n in rep["no_values"].items():
+            L.append((f"  ⚠ Arkusz „{sheet}”: {n} formuł bez policzonej wartości – otwórz plik "
+                      f"w Excelu, zapisz go i uruchom program ponownie.", "warn"))
+    if rep["unused_sheets"]:
+        L.append(("", "info"))
+        L.append(("Arkusze bez opisu w wybranym folderze: " + ", ".join(rep["unused_sheets"]), "info"))
+    L.append(("", "info"))
+    L.append((f"Plik z obliczeniami: {rep['excel']}", "info"))
+    L.append(("Zapisano do: " + ("plików oryginalnych" if rep["overwrite"] else str(rep["out_dir"])), "info"))
+    return L
+
+
+def report_text(rep):
+    return "\n".join(t for t, _ in report_lines(rep))
+
+
+# --------------------------------------------------------------------------- #
+#  Okienka (tkinter)
+# --------------------------------------------------------------------------- #
+def run_gui():
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+
+    try:  # ostre okienka na monitorach z powiększeniem (Windows)
+        import ctypes
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        pass
+
+    root = tk.Tk()
+    root.title(APP_NAME)
+    root.withdraw()
+    root.attributes("-topmost", True)
+
+    try:
+        excel = filedialog.askopenfilename(
+            parent=root, title="Krok 1/3: wskaż plik Excel z obliczeniami",
+            filetypes=[("Pliki Excel", "*.xlsx *.xlsm"), ("Wszystkie pliki", "*.*")])
+        if not excel:
+            return 0
+
+        docs_dir = os.path.dirname(excel)
+        while True:
+            docs_dir = filedialog.askdirectory(
+                parent=root, title="Krok 2/3: wskaż folder z opisami (pliki .docx)",
+                initialdir=docs_dir, mustexist=True)
+            if not docs_dir:
+                return 0
+            files = list_docx(docs_dir)
+            if files:
+                break
+            messagebox.showwarning(APP_NAME, f"W folderze\n{docs_dir}\nnie ma plików .docx.\n\n"
+                                             "Wskaż inny folder.", parent=root)
+
+        out_dir = filedialog.askdirectory(
+            parent=root, title="Krok 3/3: wskaż folder, w którym zapisać gotowe opisy",
+            initialdir=docs_dir, mustexist=False)
+        if not out_dir:
+            return 0
+        overwrite = os.path.normcase(os.path.abspath(out_dir)) == os.path.normcase(os.path.abspath(docs_dir))
+        if overwrite and not messagebox.askyesno(
+                APP_NAME, "Wybrano ten sam folder, w którym są opisy.\n"
+                          "Oryginalne pliki zostaną nadpisane.\n\nKontynuować?", parent=root):
+            return 0
+
+        win = tk.Toplevel(root)
+        win.title(APP_NAME)
+        win.resizable(False, False)
+        win.attributes("-topmost", True)
+        lbl = ttk.Label(win, text="Wczytywanie pliku Excel…", width=60)
+        lbl.pack(padx=20, pady=(20, 8))
+        bar = ttk.Progressbar(win, length=420, mode="determinate", maximum=max(1, len(files)))
+        bar.pack(padx=20, pady=(0, 20))
+        win.update()
+
+        def progress(i, n, name):
+            bar["value"] = i
+            lbl["text"] = f"Przetwarzanie {name} ({i + 1}/{n})…" if name else "Sprawdzanie czerwonych komórek…"
+            win.update()
+
+        try:
+            rep = run_batch(excel, files, out_dir, overwrite=overwrite, progress=progress)
+        finally:
+            win.destroy()
+        show_report(root, rep)
+        return 1 if any(r[1] == "blad" for r in rep["results"]) else 0
+    except Exception as e:  # noqa: BLE001
+        messagebox.showerror(APP_NAME, f"Wystąpił błąd:\n\n{e}", parent=root)
+        return 1
+    finally:
+        try:
+            root.destroy()
+        except Exception:
+            pass
+
+
+def show_report(root, rep):
+    import tkinter as tk
+    from tkinter import ttk
+
+    win = tk.Toplevel(root)
+    win.title(f"{APP_NAME} – raport")
+    win.geometry("920x620")
+    win.attributes("-topmost", True)
+    win.after(600, lambda: win.attributes("-topmost", False))
+
+    has_red = bool(rep["red"])
+    errors = any(r[1] == "blad" for r in rep["results"])
+    head_text = ("UWAGA! W tabelach z obliczeniami są czerwone komórki – sprawdź je."
+                 if has_red else "Gotowe. Nie znaleziono czerwonych komórek.")
+    if errors:
+        head_text += "  Niektórych plików nie udało się zapisać."
+    tk.Label(win, text=head_text, font=("Segoe UI", 12, "bold"), fg="white",
+             bg="#C00000" if has_red or errors else "#2E7D32", pady=10).pack(fill="x")
+
+    frame = ttk.Frame(win)
+    frame.pack(fill="both", expand=True, padx=10, pady=10)
+    txt = tk.Text(frame, wrap="word", font=("Segoe UI", 10), relief="flat", padx=8, pady=8)
+    sb = ttk.Scrollbar(frame, command=txt.yview)
+    txt.configure(yscrollcommand=sb.set)
+    sb.pack(side="right", fill="y")
+    txt.pack(side="left", fill="both", expand=True)
+    txt.tag_configure("title", font=("Segoe UI", 11, "bold"), spacing1=4, spacing3=4)
+    txt.tag_configure("ok", foreground="#2E7D32")
+    txt.tag_configure("warn", foreground="#C00000")
+    txt.tag_configure("err", foreground="#C00000", font=("Segoe UI", 10, "bold"))
+    txt.tag_configure("info", foreground="#333333")
+    for line, kind in report_lines(rep):
+        txt.insert("end", line + "\n", kind)
+    txt.configure(state="disabled")
+
+    buttons = ttk.Frame(win)
+    buttons.pack(fill="x", padx=10, pady=(0, 10))
+    target = rep["out_dir"]
+    if target and hasattr(os, "startfile"):
+        ttk.Button(buttons, text="Otwórz folder z wynikami",
+                   command=lambda: os.startfile(target)).pack(side="left")  # type: ignore[attr-defined]
+
+    def save_report():
+        from tkinter import filedialog
+        path = filedialog.asksaveasfilename(parent=win, title="Zapisz raport", defaultextension=".txt",
+                                            initialdir=target or None, initialfile="raport.txt",
+                                            filetypes=[("Plik tekstowy", "*.txt")])
+        if path:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(report_text(rep) + "\n")
+
+    ttk.Button(buttons, text="Zapisz raport…", command=save_report).pack(side="left", padx=8)
+    ttk.Button(buttons, text="Zamknij", command=win.destroy).pack(side="right")
+    win.protocol("WM_DELETE_WINDOW", win.destroy)
+    root.wait_window(win)
+
+
+# --------------------------------------------------------------------------- #
+#  Wiersz poleceń
+# --------------------------------------------------------------------------- #
 def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if not argv:
+        return run_gui()
+
     ap = argparse.ArgumentParser(
         description="Wstawia tabele obliczeń z pliku Excel do dokumentów Word "
-                    "(rozdział „Zestawienie zbiorcze słupów”).")
+                    "(rozdział „Zestawienie zbiorcze słupów”). Uruchomiony bez "
+                    "parametrów otwiera okienka wyboru plików.")
     ap.add_argument("docx", nargs="*", help="pliki .docx lub foldery (domyślnie: bieżący folder)")
     ap.add_argument("-x", "--excel", help="plik Excel z obliczeniami (domyślnie: jedyny .xlsx w folderze)")
     ap.add_argument("-o", "--wynik", default="wynik", help='folder wyjściowy (domyślnie "wynik")')
@@ -506,49 +949,65 @@ def main(argv=None):
     ap.add_argument("--arkusz", help="nazwa arkusza (gdy nazwa pliku nie odpowiada nazwie arkusza)")
     ap.add_argument("--puste-akapity", type=int, default=DEFAULT_EMPTY_PARAGRAPHS_BEFORE,
                     help="ile pustych akapitów pod nagłówkiem zostawić przed tabelą (domyślnie 5)")
+    ap.add_argument("--raport", help="zapisz raport do pliku tekstowego")
+    ap.add_argument("--okna", action="store_true", help="otwórz okienka wyboru plików")
+    ap.add_argument("--test-okien", help=argparse.SUPPRESS)  # test działania tkinter w .exe
     args = ap.parse_args(argv)
 
-    base = os.path.dirname(os.path.abspath(__file__))
+    if args.okna:
+        return run_gui()
+    if args.test_okien:
+        import tkinter as tk
+        from tkinter import filedialog, messagebox, ttk  # noqa: F401
+        root = tk.Tk()
+        root.withdraw()
+        root.update()
+        root.destroy()
+        with open(args.test_okien, "w", encoding="utf-8") as fh:
+            fh.write("tk %s OK\n" % tk.TkVersion)
+        return 0
+
     inputs = args.docx or [os.getcwd()]
     files = []
     for p in inputs:
-        if os.path.isdir(p):
-            files += sorted(glob.glob(os.path.join(p, "*.docx")))
-        else:
-            files.append(p)
-    files = [f for f in files if not os.path.basename(f).startswith("~$")]
+        files += list_docx(p) if os.path.isdir(p) else [p]
     if not files:
         print("Nie znaleziono plików .docx.")
         return 1
 
     excel = args.excel
     if not excel:
-        search_dirs = {os.path.dirname(os.path.abspath(files[0])), os.getcwd(), base}
+        search_dirs = {os.path.dirname(os.path.abspath(files[0])), os.getcwd()}
         found = sorted({os.path.abspath(f) for d in search_dirs for f in glob.glob(os.path.join(d, "*.xlsx"))
                         if not os.path.basename(f).startswith("~$")})
         if len(found) != 1:
             print("Podaj plik Excel opcją -x (znaleziono: %s)." % (", ".join(found) or "brak"))
             return 1
         excel = found[0]
-    print(f"Excel: {excel}")
-    wb = openpyxl.load_workbook(excel)
-    wb_values = openpyxl.load_workbook(excel, data_only=True)
 
-    if not args.nadpisz:
-        os.makedirs(args.wynik, exist_ok=True)
-    ok = errors = 0
-    for f in files:
-        out = f if args.nadpisz else os.path.join(args.wynik, os.path.basename(f))
-        try:
-            sheet, action, n = process(f, wb, wb_values, out, args.arkusz, args.puste_akapity)
-            print(f"  OK   {os.path.basename(f)}: {action} z arkusza \"{sheet}\" ({n} wierszy) -> {out}")
-            ok += 1
-        except Exception as e:  # noqa: BLE001
-            print(f"  BŁĄD {os.path.basename(f)}: {e}")
-            errors += 1
-    print(f"Gotowe: {ok} plików, błędów: {errors}.")
-    return 1 if errors else 0
+    rep = run_batch(excel, files, args.wynik, overwrite=args.nadpisz,
+                    sheet_name=args.arkusz, empty_before=args.puste_akapity)
+    text = report_text(rep)
+    print(text)
+    if args.raport:
+        with open(args.raport, "w", encoding="utf-8") as fh:
+            fh.write(text + "\n")
+    return 1 if any(r[1] == "blad" for r in rep["results"]) else 0
+
+
+def _fix_streams():
+    # w pliku .exe bez konsoli sys.stdout/stderr nie istnieją
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name)
+        if stream is None:
+            setattr(sys, name, open(os.devnull, "w", encoding="utf-8"))
+        else:
+            try:
+                stream.reconfigure(errors="replace")
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
+    _fix_streams()
     sys.exit(main())
